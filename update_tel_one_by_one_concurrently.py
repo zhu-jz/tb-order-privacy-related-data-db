@@ -14,6 +14,49 @@ from tqdm import tqdm
 from collections import defaultdict
 
 
+def update_value(existing_value, new_value):
+    if isinstance(new_value, (np.ndarray, list)):
+        # 如果 new_value 是 NumPy 数组或列表
+        new_value = new_value.tolist() if isinstance(new_value, np.ndarray) else new_value
+
+        if existing_value is None:
+            # 如果 existing_value 为空，则返回 new_value 并设置 to_update_flag 为 True
+            return new_value, True
+
+        existing = existing_value[0] if existing_value[0] is not None else []
+        assert isinstance(existing, list)
+
+        # 找到 new_value 中不存在于 existing 中的新元素
+        new_elements = list(set(new_value) - set(existing))
+        if not new_elements:
+            # 如果没有新元素，则无需更新，返回 None 和 False
+            return None, False
+
+        updated_value = existing + new_elements
+        
+    elif isinstance(new_value, str):
+        # 如果 new_value 是字符串
+        if existing_value is None:
+            # 如果 existing_value 为空，则返回 new_value 并设置 to_update_flag 为 True
+            return new_value, True
+
+        existing = existing_value[0] if existing_value[0] is not None else ""
+        assert isinstance(existing, str)
+
+        if existing == new_value:
+            # 如果 existing 和 new_value 相等，则无需更新，返回 None 和 False
+            return None, False
+
+        updated_value = new_value
+        
+    else:
+        # 如果 new_value 既不是数组/列表，也不是字符串，则无需更新，返回 None 和 False
+        return None, False
+
+    # 返回更新后的值和 to_update_flag 设置为 True
+    return updated_value, True
+
+
 def process_chunk(chunk, progress, queue, table_name, id_col, value_col):
     conn = psycopg2.connect(
         host="127.0.0.1",
@@ -23,59 +66,60 @@ def process_chunk(chunk, progress, queue, table_name, id_col, value_col):
     )
 
     cur = conn.cursor()
-    logs = defaultdict(list)
 
-    # update_queries = []
-    # insert_queries = []
+    try:
+        query_log = defaultdict(list)
 
-    for index, row in chunk.iterrows():
-        progress.update(1)
-        order_id = index
-        value = row[value_col]
-        value = value.tolist() if isinstance(value, np.ndarray) else value
-        assert isinstance(value, list)
-
-        cur.execute(f"SELECT {value_col} FROM {table_name} WHERE {id_col} = %s", (order_id,))
-        result = cur.fetchone()
-
-        if result is not None:
-            existing = [] if result[0] is None else result[0]
-            new = list(set(value) - set(existing))
-            if not new:
-                # new is empty list
+        # update_queries = []
+        # insert_queries = []
+        
+        for index, row in chunk.iterrows():
+            progress.update(1)
+            order_id = index
+            new_value = row[value_col]
+            
+            cur.execute(f"SELECT {value_col} FROM {table_name} WHERE {id_col} = %s", (order_id,))
+            existing_value = cur.fetchone()
+            
+            updated_value, to_update = update_value(existing_value, new_value)
+            if not to_update:
                 continue
-            updated = existing + new
-            sql_query = f"UPDATE {table_name} SET {value_col} = %s WHERE {id_col} = %s"
-            params = (updated, order_id)
-            # update_queries.append(params)
-        else:
-            sql_query = f"INSERT INTO {table_name} ({id_col}, {value_col}) VALUES (%s, %s)"
-            params = (order_id, value)
-            # insert_queries.append(params)
-
-        logs['order_id'].append(order_id)
-        logs['existing'].append(existing if result is not None else np.nan)
-        logs['updated'].append(updated if result is not None else value)
-        logs['type'].append('UPDATE' if result is not None else 'INSERT')
-        logs['sql_query'].append(cur.mogrify(sql_query, params).decode('utf-8'))
-
-    # if update_queries:
-    #     cur.executemany(f"UPDATE {table_name} SET {value_col} = %s WHERE {id_col} = %s", update_queries)
-    # if insert_queries:
-    #     cur.executemany(f"INSERT INTO {table_name} ({id_col}, {value_col}) VALUES (%s, %s)", insert_queries)
-
-    # conn.commit()
-    cur.close()
-    conn.close()
-    queue.put(logs)
-
-    return progress
+        
+            if existing_value is not None:
+                sql_query = f"UPDATE {table_name} SET {value_col} = %s WHERE {id_col} = %s"
+                params = (updated_value, order_id)
+                # update_queries.append(params)
+            else:
+                sql_query = f"INSERT INTO {table_name} ({id_col}, {value_col}) VALUES (%s, %s)"
+                params = (order_id, updated_value)
+                # insert_queries.append(params)
+        
+            query_log['order_id'].append(order_id)
+            query_log['existing'].append(existing_value[0] if existing_value is not None else np.nan)
+            query_log['updated'].append(updated_value)
+            query_log['type'].append('UPDATE' if existing_value is not None else 'INSERT')
+            query_log['sql_query'].append(cur.mogrify(sql_query, params).decode('utf-8'))
+        
+        queue.put(query_log)
+        
+        # if update_queries:
+        #     cur.executemany(f"UPDATE {table_name} SET {value_col} = %s WHERE {id_col} = %s", update_queries)
+            
+        # if insert_queries:
+        #     cur.executemany(f"INSERT INTO {table_name} ({id_col}, {value_col}) VALUES (%s, %s)", insert_queries)
+            
+        # conn.commit()
+    
+    finally:
+        cur.close()
+        conn.close()
+        return progress
 
 
 # Split the data into chunks of size 10000
-data = pd.read_pickle('update_tel.pkl')
+data = pd.read_pickle('update_手机.pkl')
 table_name = 'tb_privacy_data'
-id_col = '主订单id'
+id_col = '主订单ID'
 value_col = '手机'
 
 chunk_size = 10000
@@ -85,7 +129,7 @@ chunks = [data[i:i+chunk_size] for i in range(0, len(data), chunk_size)]
 result_queue = Queue()
 
 # Process the chunks concurrently using a thread pool
-with ThreadPoolExecutor(max_workers=7) as executor:
+with ThreadPoolExecutor(max_workers=6) as executor:
     futures = []
     progress_bars = []  # Create a list to store the progress bars
     for chunk_index, chunk in enumerate(chunks):
@@ -101,7 +145,7 @@ with ThreadPoolExecutor(max_workers=7) as executor:
         progress.close()
 
 # Retrieve the results from the queue
-logs = {'order_id': [], 'existing': [], 'updated': [], 'type': [], 'sql_query': []}
+logs = defaultdict(list)
 while not result_queue.empty():
     chunk_logs = result_queue.get()
     logs['order_id'].extend(chunk_logs['order_id'])
