@@ -4,22 +4,23 @@ Created on Mon May 15 19:25:34 2023
 @author: ZHU
 """
 
-import pika
-import pickle
-import pandas as pd
-import numpy as np
-import psycopg2
-import psycopg2.pool
-from queue import Queue
+import argparse
+import concurrent.futures
+import logging
 import os
-import time
+import pickle
 import random
 import string
+import time
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+
+import numpy as np
+import pandas as pd
+import psycopg2
+import psycopg2.pool
+import pika
 from tqdm import tqdm
-import logging
-import argparse
 
 
 # Initialize logging
@@ -38,11 +39,11 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def initialize_db_pool(maxconn):
+def initialize_db_pool(args):
     global db_pool
     db_pool = psycopg2.pool.SimpleConnectionPool(
         1,  # minconn
-        maxconn,  # maxconn
+        args.maxconn,  # maxconn
         host="127.0.0.1",
         database="postgres",
         user="postgres",
@@ -107,16 +108,16 @@ def process_chunk(chunk, result_queue):
         db_pool.putconn(conn)
 
 
-def process_message(ch, method, properties, body, num_chunks, max_workers):
+def process_message(ch, method, properties, body, args):
     dataframe = pickle.loads(body)
     result_queue = Queue()
-    chunks = np.array_split(dataframe, num_chunks)
+    chunks = np.array_split(dataframe, args.num_chunks)
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(process_chunk, chunk, result_queue) for chunk in chunks]
 
         with tqdm(total=len(chunks)) as pbar:
-            for future in as_completed(futures):
+            for future in concurrent.futures.as_completed(futures):
                 pbar.update(1)
                 try:
                     future.result()
@@ -161,7 +162,7 @@ def process_control_message(ch, method, properties, body):
         ch.stop_consuming()
 
 
-def start_receiver(num_chunks, max_workers):
+def start_receiver(args):
     credentials = pika.PlainCredentials('ZHU', 'password')
     connection = pika.BlockingConnection(pika.ConnectionParameters('localhost', credentials=credentials))
     channel = connection.channel()
@@ -172,7 +173,7 @@ def start_receiver(num_chunks, max_workers):
     channel.basic_qos(prefetch_count=1)
 
     # Pass num_chunks and max_workers to process_message
-    on_message_callback = lambda ch, method, properties, body: process_message(ch, method, properties, body, num_chunks, max_workers)
+    on_message_callback = lambda ch, method, properties, body: process_message(ch, method, properties, body, args)
     channel.basic_consume(queue='dataframe_queue', on_message_callback=on_message_callback)
     channel.basic_consume(queue='control_queue', on_message_callback=process_control_message)
 
@@ -188,5 +189,5 @@ def start_receiver(num_chunks, max_workers):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    initialize_db_pool(args.maxconn)
-    start_receiver(args.num_chunks, args.max_workers)
+    initialize_db_pool(args)
+    start_receiver(args)
